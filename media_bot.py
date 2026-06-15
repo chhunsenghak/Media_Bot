@@ -38,6 +38,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+import httpx
 import yt_dlp
 
 load_dotenv()
@@ -47,32 +48,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-
-# Decode base64 cookies from env var and write to a temp file for yt-dlp.
-# On Fly.io: fly secrets set YOUTUBE_COOKIES_B64="$(base64 -w0 cookies.txt)"
-_cookies_tmp_file = None
-
-def _init_cookies() -> str | None:
-    global _cookies_tmp_file
-    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-    if not b64:
-        return os.getenv("YOUTUBE_COOKIES_FILE", "")
-    try:
-        data = base64.b64decode(b64)
-        tmp = tempfile.NamedTemporaryFile(
-            mode="wb", suffix=".txt", delete=False
-        )
-        tmp.write(data)
-        tmp.flush()
-        tmp.close()
-        _cookies_tmp_file = tmp.name
-        atexit.register(lambda: os.unlink(_cookies_tmp_file) if os.path.exists(_cookies_tmp_file) else None)
-        logger_pre = logging.getLogger(__name__)
-        logger_pre.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64 → %s", tmp.name)
-        return tmp.name
-    except Exception as exc:
-        logging.getLogger(__name__).warning("Failed to decode YOUTUBE_COOKIES_B64: %s", exc)
-        return None
 
 SUPPORTED_URL_PATTERN = re.compile(
     r"https?://("
@@ -103,6 +78,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── YouTube Auth ─────────────────────────────────────────────────────────────
+
+_YOUTUBE_CACHE_DIR = "/tmp/yt_cache"
+_youtube_use_oauth2: bool = False
+_youtube_cookies_file: str | None = None
+
+
+def _init_youtube_auth() -> None:
+    global _youtube_use_oauth2, _youtube_cookies_file
+
+    # Priority 1: OAuth2 token — auto-refreshes, no periodic re-export needed
+    b64_token = os.getenv("YOUTUBE_OAUTH2_TOKEN_B64", "").strip()
+    if b64_token:
+        token_dir = os.path.join(_YOUTUBE_CACHE_DIR, "youtube-oauth2")
+        os.makedirs(token_dir, exist_ok=True)
+        try:
+            with open(os.path.join(token_dir, "token.json"), "wb") as f:
+                f.write(base64.b64decode(b64_token))
+            _youtube_use_oauth2 = True
+            logger.info("YouTube: OAuth2 token loaded.")
+            return
+        except Exception as exc:
+            logger.warning("YOUTUBE_OAUTH2_TOKEN_B64 decode failed: %s", exc)
+
+    # Priority 2: Cookies base64 env var
+    b64_cookies = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if b64_cookies:
+        try:
+            tmp = tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False)
+            tmp.write(base64.b64decode(b64_cookies))
+            tmp.flush()
+            tmp.close()
+            atexit.register(lambda p=tmp.name: os.unlink(p) if os.path.exists(p) else None)
+            _youtube_cookies_file = tmp.name
+            logger.info("YouTube: cookies loaded from env var.")
+            return
+        except Exception as exc:
+            logger.warning("YOUTUBE_COOKIES_B64 decode failed: %s", exc)
+
+    # Priority 3: Cookies file path
+    path = os.getenv("YOUTUBE_COOKIES_FILE", "")
+    if path and os.path.isfile(path):
+        _youtube_cookies_file = path
+        logger.info("YouTube: cookies loaded from file.")
+
+
+_init_youtube_auth()
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def h(text) -> str:
@@ -123,14 +146,12 @@ def detect_platform(url: str) -> str:
     return "Video"
 
 
-YOUTUBE_COOKIES_FILE = _init_cookies()
-
-
 def _common_ydl_opts(output_path: str) -> dict:
     opts = {
         "outtmpl": output_path,
-        "quiet":   True,
+        "quiet": True,
         "noplaylist": True,
+        "cachedir": _YOUTUBE_CACHE_DIR,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -139,20 +160,81 @@ def _common_ydl_opts(output_path: str) -> dict:
             )
         },
     }
-    if YOUTUBE_COOKIES_FILE and os.path.isfile(YOUTUBE_COOKIES_FILE):
-        opts["cookiefile"] = YOUTUBE_COOKIES_FILE
+    if _youtube_cookies_file and os.path.isfile(_youtube_cookies_file):
+        opts["cookiefile"] = _youtube_cookies_file
     return opts
 
 
-def _youtube_extractor_args(base: dict | None = None) -> dict:
-    args = base or {}
-    # tv_embedded bypasses bot-detection on server IPs; ios as fallback
-    args.setdefault("youtube", {})["player_client"] = ["tv_embedded", "ios", "web"]
-    return args
+def _apply_youtube_opts(opts: dict) -> None:
+    """Apply YouTube-specific yt-dlp options (player clients + OAuth2 if available)."""
+    opts["extractor_args"] = {"youtube": {"player_client": ["ios", "mweb", "web"]}}
+    if _youtube_use_oauth2:
+        opts["username"] = "oauth2"
+        opts["password"] = ""
+
+
+# ─── Cobalt (YouTube primary downloader) ──────────────────────────────────────
+
+_COBALT_API = "https://api.cobalt.tools/"
+_COBALT_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+
+
+def _cobalt_resolve(url: str, audio_only: bool) -> str:
+    """Ask Cobalt for a direct download URL. Raises RuntimeError on failure."""
+    payload = {
+        "url": url,
+        "downloadMode": "audio" if audio_only else "auto",
+        "videoQuality": "1080",
+    }
+    if audio_only:
+        payload["audioFormat"] = "mp3"
+
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(_COBALT_API, json=payload, headers=_COBALT_HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    status = data.get("status")
+    if status in ("redirect", "tunnel"):
+        return data["url"]
+    if status == "picker":
+        return data["picker"][0]["url"]
+    code = data.get("error", {}).get("code", "unknown")
+    raise RuntimeError(f"Cobalt rejected the URL: {code}")
+
+
+def _cobalt_download(url: str, output_path: str, audio_only: bool) -> tuple[str, str]:
+    """
+    Download via Cobalt API. Returns (file_path, title).
+    Falls back to yt-dlp on any Cobalt failure.
+    """
+    dl_url = _cobalt_resolve(url, audio_only)
+    ext = "mp3" if audio_only else "mp4"
+    file_path = output_path.replace("%(ext)s", ext)
+
+    with httpx.Client(timeout=600, follow_redirects=True) as client:
+        with client.stream("GET", dl_url) as resp:
+            resp.raise_for_status()
+            with open(file_path, "wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
+
+    return file_path, ""
 
 
 def download_video(url: str, output_path: str) -> tuple[str, str]:
-    """Download as MP4. Returns (prepared_filename, title)."""
+    """Download as MP4. Returns (file_path, title)."""
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+    if is_youtube:
+        try:
+            return _cobalt_download(url, output_path, audio_only=False)
+        except Exception as exc:
+            logger.warning("Cobalt failed (%s) — falling back to yt-dlp", exc)
+
     opts = _common_ydl_opts(output_path)
     opts.update({
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -160,8 +242,9 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
     })
     if "tiktok.com" in url.lower():
         opts["extractor_args"] = {"tiktok": {"webpage_url_basename": "video"}}
-    elif "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        opts["extractor_args"] = _youtube_extractor_args()
+    elif is_youtube:
+        _apply_youtube_opts(opts)
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info), info.get("title", "")
@@ -169,6 +252,14 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
 
 def download_audio(url: str, output_path: str) -> tuple[str, str]:
     """Download as MP3 192 kbps. Returns (mp3_path, title)."""
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+    if is_youtube:
+        try:
+            return _cobalt_download(url, output_path, audio_only=True)
+        except Exception as exc:
+            logger.warning("Cobalt failed (%s) — falling back to yt-dlp", exc)
+
     opts = _common_ydl_opts(output_path)
     opts.update({
         "format": "bestaudio/best",
@@ -178,8 +269,9 @@ def download_audio(url: str, output_path: str) -> tuple[str, str]:
             "preferredquality": "192",
         }],
     })
-    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
-        opts["extractor_args"] = _youtube_extractor_args()
+    if is_youtube:
+        _apply_youtube_opts(opts)
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         base = ydl.prepare_filename(info)
