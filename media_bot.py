@@ -176,10 +176,14 @@ def _apply_youtube_opts(opts: dict) -> None:
 # ─── Cobalt (YouTube primary downloader) ──────────────────────────────────────
 
 _COBALT_API = "https://api.cobalt.tools/"
-_COBALT_HEADERS = {
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-}
+_COBALT_API_KEY = os.getenv("COBALT_API_KEY", "")
+
+
+def _cobalt_headers() -> dict:
+    h = {"Accept": "application/json", "Content-Type": "application/json"}
+    if _COBALT_API_KEY:
+        h["Authorization"] = f"Api-Key {_COBALT_API_KEY}"
+    return h
 
 
 def _cobalt_resolve(url: str, audio_only: bool) -> str:
@@ -193,17 +197,21 @@ def _cobalt_resolve(url: str, audio_only: bool) -> str:
         payload["audioFormat"] = "mp3"
 
     with httpx.Client(timeout=30) as client:
-        resp = client.post(_COBALT_API, json=payload, headers=_COBALT_HEADERS)
-        resp.raise_for_status()
+        resp = client.post(_COBALT_API, json=payload, headers=_cobalt_headers())
+        if not resp.is_success:
+            logger.warning("Cobalt HTTP %s — body: %s", resp.status_code, resp.text[:300])
+            resp.raise_for_status()
         data = resp.json()
 
     status = data.get("status")
+    logger.info("Cobalt status=%s for %s", status, url)
     if status in ("redirect", "tunnel"):
         return data["url"]
     if status == "picker":
         return data["picker"][0]["url"]
     code = data.get("error", {}).get("code", "unknown")
-    raise RuntimeError(f"Cobalt rejected the URL: {code}")
+    logger.warning("Cobalt error body: %s", data)
+    raise RuntimeError(f"Cobalt: {code}")
 
 
 def _cobalt_download(url: str, output_path: str, audio_only: bool) -> tuple[str, str]:
@@ -237,7 +245,7 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
 
     opts = _common_ydl_opts(output_path)
     opts.update({
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
     })
     if "tiktok.com" in url.lower():
