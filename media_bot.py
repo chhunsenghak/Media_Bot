@@ -95,8 +95,11 @@ def detect_platform(url: str) -> str:
     return "Video"
 
 
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
+
+
 def _common_ydl_opts(output_path: str) -> dict:
-    return {
+    opts = {
         "outtmpl": output_path,
         "quiet":   True,
         "noplaylist": True,
@@ -108,6 +111,15 @@ def _common_ydl_opts(output_path: str) -> dict:
             )
         },
     }
+    if YOUTUBE_COOKIES_FILE and os.path.isfile(YOUTUBE_COOKIES_FILE):
+        opts["cookiefile"] = YOUTUBE_COOKIES_FILE
+    return opts
+
+
+def _youtube_extractor_args(base: dict | None = None) -> dict:
+    args = base or {}
+    args.setdefault("youtube", {})["player_client"] = ["ios", "web"]
+    return args
 
 
 def download_video(url: str, output_path: str) -> tuple[str, str]:
@@ -119,6 +131,8 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
     })
     if "tiktok.com" in url.lower():
         opts["extractor_args"] = {"tiktok": {"webpage_url_basename": "video"}}
+    elif "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        opts["extractor_args"] = _youtube_extractor_args()
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info), info.get("title", "")
@@ -135,6 +149,8 @@ def download_audio(url: str, output_path: str) -> tuple[str, str]:
             "preferredquality": "192",
         }],
     })
+    if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        opts["extractor_args"] = _youtube_extractor_args()
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         base = ydl.prepare_filename(info)
