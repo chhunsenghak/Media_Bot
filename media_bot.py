@@ -16,9 +16,11 @@ Setup:
 import os
 import re
 import sys
+import base64
 import asyncio
 import tempfile
 import logging
+import atexit
 from pathlib import Path
 
 # Fix: ProactorEventLoop (Windows default) conflicts with httpx/anyio → ReadTimeout
@@ -45,6 +47,32 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# Decode base64 cookies from env var and write to a temp file for yt-dlp.
+# On Fly.io: fly secrets set YOUTUBE_COOKIES_B64="$(base64 -w0 cookies.txt)"
+_cookies_tmp_file = None
+
+def _init_cookies() -> str | None:
+    global _cookies_tmp_file
+    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if not b64:
+        return os.getenv("YOUTUBE_COOKIES_FILE", "")
+    try:
+        data = base64.b64decode(b64)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".txt", delete=False
+        )
+        tmp.write(data)
+        tmp.flush()
+        tmp.close()
+        _cookies_tmp_file = tmp.name
+        atexit.register(lambda: os.unlink(_cookies_tmp_file) if os.path.exists(_cookies_tmp_file) else None)
+        logger_pre = logging.getLogger(__name__)
+        logger_pre.info("YouTube cookies loaded from YOUTUBE_COOKIES_B64 → %s", tmp.name)
+        return tmp.name
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Failed to decode YOUTUBE_COOKIES_B64: %s", exc)
+        return None
 
 SUPPORTED_URL_PATTERN = re.compile(
     r"https?://("
@@ -95,7 +123,7 @@ def detect_platform(url: str) -> str:
     return "Video"
 
 
-YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
+YOUTUBE_COOKIES_FILE = _init_cookies()
 
 
 def _common_ydl_opts(output_path: str) -> dict:
@@ -118,7 +146,8 @@ def _common_ydl_opts(output_path: str) -> dict:
 
 def _youtube_extractor_args(base: dict | None = None) -> dict:
     args = base or {}
-    args.setdefault("youtube", {})["player_client"] = ["ios", "web"]
+    # tv_embedded bypasses bot-detection on server IPs; ios as fallback
+    args.setdefault("youtube", {})["player_client"] = ["tv_embedded", "ios", "web"]
     return args
 
 
