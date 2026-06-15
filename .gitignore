@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+
+# Fly.io (not using, but keep out)
+fly.toml
+
+# OS
+.DS_Store
+Thumbs.db
