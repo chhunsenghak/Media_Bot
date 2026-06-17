@@ -16,13 +16,11 @@ Setup:
 import os
 import re
 import sys
-import time
 import base64
 import asyncio
 import tempfile
 import logging
 import atexit
-from collections import defaultdict
 from pathlib import Path
 
 # Fix: ProactorEventLoop (Windows default) conflicts with httpx/anyio → ReadTimeout
@@ -73,15 +71,6 @@ PLATFORM_LABELS = {
     "facebook.com": "Facebook",
     "fb.watch":     "Facebook",
 }
-
-ALLOWED_FORMATS = {"mp4", "mp3"}
-MAX_URL_LENGTH   = 2048
-
-# Rate limit: at most RATE_LIMIT_MAX requests per RATE_LIMIT_WINDOW seconds per user
-RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX    = int(os.getenv("RATE_LIMIT_MAX", "5"))
-
-_user_request_times: dict[int, list[float]] = defaultdict(list)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -145,21 +134,8 @@ def h(text) -> str:
 
 
 def extract_media_url(text: str) -> str | None:
-    if len(text) > MAX_URL_LENGTH:
-        return None
     match = SUPPORTED_URL_PATTERN.search(text)
     return match.group(0) if match else None
-
-
-def _is_rate_limited(user_id: int) -> bool:
-    now = time.monotonic()
-    timestamps = _user_request_times[user_id]
-    # Drop timestamps outside the window
-    _user_request_times[user_id] = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
-    if len(_user_request_times[user_id]) >= RATE_LIMIT_MAX:
-        return True
-    _user_request_times[user_id].append(now)
-    return False
 
 
 def detect_platform(url: str) -> str:
@@ -364,22 +340,11 @@ async def handle_format_choice(
     query = update.callback_query
     await query.answer()
 
-    parts = query.data.split(":")
-    fmt = parts[1] if len(parts) == 2 else ""
-    if fmt not in ALLOWED_FORMATS:
-        await query.edit_message_text("❌ Invalid format requested.")
-        return
-
+    fmt = query.data.split(":")[1]
     url = context.user_data.get("media_url")
-    if not url or not SUPPORTED_URL_PATTERN.fullmatch(url):
-        await query.edit_message_text("❌ Session expired or invalid URL. Please send the link again.")
-        return
 
-    user_id = query.from_user.id
-    if _is_rate_limited(user_id):
-        await query.edit_message_text(
-            f"⏱ Too many requests. Please wait before trying again."
-        )
+    if not url:
+        await query.edit_message_text("❌ Session expired. Please send the link again.")
         return
 
     platform = detect_platform(url)
