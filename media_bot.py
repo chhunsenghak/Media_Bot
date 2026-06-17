@@ -167,7 +167,7 @@ def _common_ydl_opts(output_path: str) -> dict:
 
 def _apply_youtube_opts(opts: dict) -> None:
     """Apply YouTube-specific yt-dlp options (player clients + OAuth2 if available)."""
-    opts["extractor_args"] = {"youtube": {"player_client": ["ios", "android", "mweb", "web"]}}
+    opts["extractor_args"] = {"youtube": {"player_client": ["tv_embedded", "ios", "android", "mweb", "web"]}}
     if _youtube_use_oauth2:
         opts["username"] = "oauth2"
         opts["password"] = ""
