@@ -252,7 +252,7 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
     if "tiktok.com" in url.lower():
         opts["extractor_args"] = {"tiktok": {"webpage_url_basename": "video"}}
     elif is_youtube:
-        _apply_youtube_opts(opts)
+        _apply_youtube_opts(opts) 
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
