@@ -167,7 +167,7 @@ def _common_ydl_opts(output_path: str) -> dict:
 
 def _apply_youtube_opts(opts: dict) -> None:
     """Apply YouTube-specific yt-dlp options (player clients + OAuth2 if available)."""
-    opts["extractor_args"] = {"youtube": {"player_client": ["ios", "mweb", "web"]}}
+    opts["extractor_args"] = {"youtube": {"player_client": ["ios", "android", "mweb", "web"]}}
     if _youtube_use_oauth2:
         opts["username"] = "oauth2"
         opts["password"] = ""
@@ -245,7 +245,8 @@ def download_video(url: str, output_path: str) -> tuple[str, str]:
 
     opts = _common_ydl_opts(output_path)
     opts.update({
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "format": "bestvideo*+bestaudio*/best",
+        "format_sort": ["res", "ext:mp4:m4a"],
         "merge_output_format": "mp4",
     })
     if "tiktok.com" in url.lower():
